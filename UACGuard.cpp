@@ -1,22 +1,10 @@
-/*
- * UACGuard.cpp
- * Сторож UAC с асинхронным диалогом, watchdog-процессом и логированием в Event Log.
- * Компиляция (MinGW x64):
- *   g++ -O2 -static UACGuard.cpp -o UACGuard.exe -ladvapi32 -luser32 -lwevtapi
- *
- * Требования: Windows Vista+, права администратора.
- * Программа устанавливается в HKLM\Run, отслеживает настройки UAC в реестре
- * и восстанавливает их после подтверждения пользователем, если они ослаблены или отключены.
- * Watchdog-процесс обеспечивает перезапуск при принудительном завершении.
- */
+
 
 #include <windows.h>
-#include <iostream>
 #include <string>
 #include <atomic>
 #include <thread>
-#include <sstream>
-#include <iomanip>
+#include <mutex>
 
 // =========================== НАСТРОЙКИ ===========================
 namespace Config {
@@ -25,48 +13,60 @@ namespace Config {
     constexpr wchar_t APP_NAME[]       = L"UACGuard";
     constexpr wchar_t MUTEX_NAME[]     = L"Global\\UACGuard_Mutex";
     constexpr wchar_t WATCHDOG_ARG[]   = L"--watchdog";
-    constexpr DWORD   ENABLE_LUA       = 1;    // UAC включён
-    constexpr DWORD   CONSENT_PROMPT   = 5;    // Запрос согласия для админов
-    constexpr DWORD   SECURE_DESKTOP   = 1;    // Безопасный рабочий стол
-    constexpr DWORD   DIALOG_TIMEOUT_SEC = 30; // Таймаут диалога в секундах
-    constexpr DWORD   AUTORUN_CHECK_SEC  = 60; // Период проверки автозагрузки
+    constexpr DWORD   ENABLE_LUA       = 1;
+    constexpr DWORD   CONSENT_PROMPT   = 5;
+    constexpr DWORD   SECURE_DESKTOP   = 1;
+    constexpr DWORD   DIALOG_TIMEOUT_SEC = 30;
+    constexpr DWORD   DIALOG_CLOSE_DELAY_SEC = 3;
+    constexpr DWORD   AUTORUN_CHECK_SEC  = 60;
+    constexpr DWORD   LOG_ERROR_INTERVAL_SEC = 60;
+    constexpr DWORD   WATCHDOG_RESTART_DELAY_SEC = 5;
+    constexpr DWORD   THREAD_JOIN_TIMEOUT_MS = 5000;   // Таймаут ожидания потоков при завершении
 }
 
-// =========================== ЛОГИРОВАНИЕ В EVENT LOG ===========================
+// =========================== ЛОГИРОВАНИЕ ===========================
 class EventLogger {
 public:
     EventLogger() : hEventLog(nullptr) {
         hEventLog = RegisterEventSourceW(nullptr, Config::APP_NAME);
         if (!hEventLog) {
-            // Пробуем создать источник событий в реестре
-            CreateEventSource();
-            hEventLog = RegisterEventSourceW(nullptr, Config::APP_NAME);
+            if (CreateEventSource()) {
+                hEventLog = RegisterEventSourceW(nullptr, Config::APP_NAME);
+            }
         }
     }
+
     ~EventLogger() {
         if (hEventLog) DeregisterEventSource(hEventLog);
     }
 
-    void LogInfo(const std::wstring& msg) {
-        Log(EVENTLOG_INFORMATION_TYPE, msg);
-    }
-    void LogWarning(const std::wstring& msg) {
-        Log(EVENTLOG_WARNING_TYPE, msg);
-    }
-    void LogError(const std::wstring& msg) {
-        Log(EVENTLOG_ERROR_TYPE, msg);
-    }
+    void LogInfo(const std::wstring& msg)   { Log(EVENTLOG_INFORMATION_TYPE, msg); }
+    void LogWarning(const std::wstring& msg) { Log(EVENTLOG_WARNING_TYPE, msg); }
+    void LogError(const std::wstring& msg)   { Log(EVENTLOG_ERROR_TYPE, msg); }
 
 private:
     HANDLE hEventLog;
+    std::mutex logMutex;
+    DWORD lastErrorTime = 0;
+    std::wstring lastErrorMessage;
 
     void Log(WORD type, const std::wstring& msg) {
-        if (!hEventLog) return;
-        LPCWSTR strings[] = { msg.c_str() };
-        ReportEventW(hEventLog, type, 0, 0, nullptr, 1, 0, strings, nullptr);
+        std::lock_guard<std::mutex> lock(logMutex);
+        if (type == EVENTLOG_ERROR_TYPE) {
+            DWORD now = GetTickCount64();
+            if (msg == lastErrorMessage && (now - lastErrorTime) < Config::LOG_ERROR_INTERVAL_SEC * 1000)
+                return;
+            lastErrorTime = now;
+            lastErrorMessage = msg;
+        }
+        if (hEventLog) {
+            LPCWSTR strings[] = { msg.c_str() };
+            ReportEventW(hEventLog, type, 0, 0, nullptr, 1, 0, strings, nullptr);
+        }
+        OutputDebugStringW((L"UACGuard: " + msg + L"\n").c_str());
     }
 
-    void CreateEventSource() {
+    bool CreateEventSource() {
         HKEY hKey;
         DWORD dwData = EVENTLOG_ERROR_TYPE | EVENTLOG_WARNING_TYPE | EVENTLOG_INFORMATION_TYPE;
         std::wstring keyPath = L"SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\" + std::wstring(Config::APP_NAME);
@@ -74,25 +74,49 @@ private:
                             REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
             RegSetValueExW(hKey, L"TypesSupported", 0, REG_DWORD, (BYTE*)&dwData, sizeof(dwData));
             RegCloseKey(hKey);
+            return true;
         }
+        return false;
     }
 };
 
-// Глобальный логгер
 EventLogger g_logger;
 
 // =========================== ГЛОБАЛЬНАЯ СИНХРОНИЗАЦИЯ ===========================
 struct GlobalState {
-    std::atomic<bool> restoreInProgress{ false };   // Идёт восстановление настроек
-    std::atomic<bool> dialogActive{ false };         // Диалог уже открыт
-    std::atomic<bool> shutdownRequested{ false };    // Запрошено завершение
+    std::atomic<bool> restoreInProgress{ false };
+    std::atomic<bool> dialogActive{ false };
+    std::atomic<bool> shutdownRequested{ false };
 };
 
 GlobalState g_state;
 
-// Глобальные события
-HANDLE g_hUacChangedEvent = nullptr;   // Сигнал: настройки UAC изменились
-HANDLE g_hShutdownEvent   = nullptr;   // Сигнал: пора завершаться
+HANDLE g_hUacChangedEvent = nullptr;
+HANDLE g_hShutdownEvent   = nullptr;
+HANDLE g_hWatchdogProcess = nullptr;
+
+// =========================== ОБРАБОТЧИК КОНСОЛЬНЫХ СОБЫТИЙ ===========================
+BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType) {
+    switch (dwCtrlType) {
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        g_logger.LogInfo(L"Получен сигнал завершения системы/консоли.");
+        g_state.shutdownRequested = true;
+        if (g_hShutdownEvent) SetEvent(g_hShutdownEvent);
+        // Даём потокам время завершиться
+        Sleep(1000);
+        // При выключении системы убиваем watchdog, чтобы избежать перезапуска
+        if (dwCtrlType == CTRL_SHUTDOWN_EVENT && g_hWatchdogProcess) {
+            TerminateProcess(g_hWatchdogProcess, 0);
+            CloseHandle(g_hWatchdogProcess);
+            g_hWatchdogProcess = nullptr;
+        }
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
 
 // =========================== РАБОТА С РЕЕСТРОМ ===========================
 bool SetRegistryDword(HKEY hKeyRoot, const wchar_t* subKey, const wchar_t* valueName, DWORD data) {
@@ -117,7 +141,10 @@ bool GetRegistryDword(HKEY hKeyRoot, const wchar_t* subKey, const wchar_t* value
 // =========================== АВТОЗАГРУЗКА ===========================
 void InstallAutorun() {
     wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) {
+        g_logger.LogError(L"Не удалось получить путь к исполняемому файлу.");
+        return;
+    }
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, Config::AUTORUN_KEY, 0, KEY_WRITE | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
         RegSetValueExW(hKey, Config::APP_NAME, 0, REG_SZ,
@@ -147,54 +174,95 @@ void EnsureAutorun() {
     }
 }
 
-// =========================== ДИАЛОГ С ПОЛЬЗОВАТЕЛЕМ ===========================
+// =========================== ДИАЛОГ С ПОЛЬЗОВАТЕЛЕМ (нативный консольный ввод-вывод) ===========================
 bool ShowDialogAndGetConsent() {
-    // Не даём открыть два диалога одновременно
-    if (g_state.dialogActive.exchange(true)) {
+    if (g_state.dialogActive.exchange(true))
         return false;
+
+    // Захват консоли
+    bool allocated = AllocConsole() != FALSE;
+    if (!allocated) {
+        if (GetLastError() == ERROR_ACCESS_DENIED) {
+            // Консоль уже существует у процесса, прикрепляемся
+            if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+                g_state.dialogActive = false;
+                return false;
+            }
+        } else {
+            g_state.dialogActive = false;
+            return false;
+        }
     }
 
-    if (!AllocConsole()) {
+    // Устанавливаем кодировку UTF-8 для консоли
+    SetConsoleCP(65001);
+    SetConsoleOutputCP(65001);
+    HANDLE hConsoleOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hConsoleIn  = GetStdHandle(STD_INPUT_HANDLE);
+
+    if (hConsoleOut == INVALID_HANDLE_VALUE || hConsoleIn == INVALID_HANDLE_VALUE) {
+        if (allocated) FreeConsole(); else AttachConsole(ATTACH_PARENT_PROCESS);
         g_state.dialogActive = false;
         return false;
     }
 
-    FILE* f;
-    freopen_s(&f, "CONIN$", "r", stdin);
-    freopen_s(&f, "CONOUT$", "w", stdout);
+    const wchar_t* prompt =
+        L"========================================\n"
+        L"     UAC PROTECTION — НАСТРОЙКИ ИЗМЕНЕНЫ!\n"
+        L"========================================\n"
+        L"UAC был отключён или ослаблен.\n"
+        L"Восстановить безопасные настройки? (Y/N)\n"
+        L"Таймаут 30 секунд (по умолчанию: Нет).\n\n";
 
-    std::wcout << L"========================================\n";
-    std::wcout << L"     UAC PROTECTION — НАСТРОЙКИ ИЗМЕНЕНЫ!\n";
-    std::wcout << L"========================================\n";
-    std::wcout << L"UAC был отключён или ослаблен.\n";
-    std::wcout << L"Восстановить безопасные настройки? (Y/N)\n";
-    std::wcout << L"Таймаут " << Config::DIALOG_TIMEOUT_SEC << L" секунд (по умолчанию: Нет).\n\n";
+    DWORD written;
+    WriteConsoleW(hConsoleOut, prompt, (DWORD)wcslen(prompt), &written, nullptr);
 
-    std::string answer;
+    std::wstring answer;
     bool answered = false;
-    DWORD startTick = GetTickCount();
-    HANDLE hStdIn = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD64 startTick = GetTickCount64();
 
-    while ((GetTickCount() - startTick) < Config::DIALOG_TIMEOUT_SEC * 1000) {
-        if (WaitForSingleObject(hStdIn, 100) == WAIT_OBJECT_0) {
-            std::cin >> answer;
-            answered = true;
-            break;
+    while ((GetTickCount64() - startTick) < static_cast<DWORD64>(Config::DIALOG_TIMEOUT_SEC) * 1000) {
+        // Проверяем, есть ли ввод
+        DWORD events;
+        if (WaitForSingleObject(hConsoleIn, 100) == WAIT_OBJECT_0) {
+            wchar_t buffer[256] = {0};
+            DWORD read;
+            if (ReadConsoleW(hConsoleIn, buffer, 255, &read, nullptr) && read > 0) {
+                // Убираем символы \r\n в конце
+                std::wstring input(buffer, read);
+                size_t end = input.find_last_not_of(L"\r\n");
+                if (end != std::wstring::npos)
+                    input = input.substr(0, end + 1);
+                answer = input;
+                answered = true;
+                break;
+            }
         }
         if (g_state.shutdownRequested) break;
     }
 
     bool consent = false;
-    if (answered && (answer == "Y" || answer == "y")) {
+    if (answered && (answer == L"Y" || answer == L"y" || answer == L"д" || answer == L"Д" || answer == L"yes" || answer == L"Yes")) {
         consent = true;
-        std::wcout << L"\nВосстанавливаю настройки UAC...\n";
+        const wchar_t* msgRestore = L"\nВосстанавливаю настройки UAC...\n";
+        WriteConsoleW(hConsoleOut, msgRestore, (DWORD)wcslen(msgRestore), &written, nullptr);
     } else {
-        std::wcout << L"\nДействие отменено или истекло время ожидания.\n";
+        const wchar_t* msgCancel = L"\nДействие отменено или истекло время ожидания.\n";
+        WriteConsoleW(hConsoleOut, msgCancel, (DWORD)wcslen(msgCancel), &written, nullptr);
     }
 
-    std::wcout << L"Окно закроется через 3 секунды...\n";
-    Sleep(3000);
-    FreeConsole();
+    wchar_t msgClose[128];
+    swprintf_s(msgClose, L"Окно закроется через %lu секунд...\n", Config::DIALOG_CLOSE_DELAY_SEC);
+    WriteConsoleW(hConsoleOut, msgClose, (DWORD)wcslen(msgClose), &written, nullptr);
+    Sleep(Config::DIALOG_CLOSE_DELAY_SEC * 1000);
+
+    // Освобождаем консоль
+    if (allocated) {
+        FreeConsole();
+    } else {
+        // Открепляемся обратно
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 
     g_state.dialogActive = false;
     return consent;
@@ -202,30 +270,20 @@ bool ShowDialogAndGetConsent() {
 
 // =========================== ПРОВЕРКА И ВОССТАНОВЛЕНИЕ UAC ===========================
 bool IsUACIntact() {
-    DWORD enableLua, consent, secureDesktop;
-    bool intact = true;
-
-    if (!GetRegistryDword(HKEY_LOCAL_MACHINE, Config::REG_PATH, L"EnableLUA", enableLua) ||
-        enableLua != Config::ENABLE_LUA) {
-        intact = false;
-    }
-    if (!GetRegistryDword(HKEY_LOCAL_MACHINE, Config::REG_PATH, L"ConsentPromptBehaviorAdmin", consent) ||
-        consent != Config::CONSENT_PROMPT) {
-        intact = false;
-    }
-    if (!GetRegistryDword(HKEY_LOCAL_MACHINE, Config::REG_PATH, L"PromptOnSecureDesktop", secureDesktop) ||
-        secureDesktop != Config::SECURE_DESKTOP) {
-        intact = false;
-    }
-    return intact;
+    DWORD val;
+    if (!GetRegistryDword(HKEY_LOCAL_MACHINE, Config::REG_PATH, L"EnableLUA", val) || val != Config::ENABLE_LUA)
+        return false;
+    if (!GetRegistryDword(HKEY_LOCAL_MACHINE, Config::REG_PATH, L"ConsentPromptBehaviorAdmin", val) || val != Config::CONSENT_PROMPT)
+        return false;
+    if (!GetRegistryDword(HKEY_LOCAL_MACHINE, Config::REG_PATH, L"PromptOnSecureDesktop", val) || val != Config::SECURE_DESKTOP)
+        return false;
+    return true;
 }
 
 void RestoreUAC() {
-    // Защита от повторного входа
     bool expected = false;
-    if (!g_state.restoreInProgress.compare_exchange_strong(expected, true)) {
+    if (!g_state.restoreInProgress.compare_exchange_strong(expected, true))
         return;
-    }
 
     bool success = true;
     success &= SetRegistryDword(HKEY_LOCAL_MACHINE, Config::REG_PATH, L"EnableLUA", Config::ENABLE_LUA);
@@ -234,7 +292,6 @@ void RestoreUAC() {
 
     if (success) {
         g_logger.LogInfo(L"Настройки UAC восстановлены.");
-        // Уведомляем систему об изменении политики
         SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Policy",
                             SMTO_ABORTIFHUNG, 2000, nullptr);
     } else {
@@ -245,25 +302,19 @@ void RestoreUAC() {
 }
 
 // =========================== ПОТОК-ОБРАБОТЧИК ===========================
-// Ждёт сигнала об изменении реестра и запускает диалог
 DWORD WINAPI HandlerThreadProc(LPVOID) {
     while (!g_state.shutdownRequested) {
         DWORD waitResult = WaitForSingleObject(g_hUacChangedEvent, 1000);
         if (waitResult == WAIT_OBJECT_0) {
-            ResetEvent(g_hUacChangedEvent);
-            if (g_state.shutdownRequested) break;
-            if (g_state.restoreInProgress) continue;
+            if (g_state.shutdownRequested || g_state.restoreInProgress) continue;
             if (!IsUACIntact()) {
                 g_logger.LogWarning(L"Настройки UAC были изменены.");
-                if (ShowDialogAndGetConsent()) {
+                if (ShowDialogAndGetConsent())
                     RestoreUAC();
-                } else {
+                else
                     g_logger.LogInfo(L"Пользователь отказался от восстановления.");
-                }
             }
-        } else if (waitResult == WAIT_TIMEOUT) {
-            continue;
-        } else {
+        } else if (waitResult != WAIT_TIMEOUT) {
             break;
         }
     }
@@ -279,38 +330,31 @@ DWORD WINAPI MonitorThreadProc(LPVOID) {
                                  KEY_READ | KEY_WOW64_64KEY, &hKey);
         if (res != ERROR_SUCCESS) {
             g_logger.LogError(L"Не удалось открыть ключ реестра UAC. Повтор через 5 секунд...");
-            Sleep(5000);
+            WaitForSingleObject(g_hShutdownEvent, 5000);
             continue;
         }
 
-        // Сразу сигнализируем о проверке — вдруг что-то изменилось, пока мы не следили
         SetEvent(g_hUacChangedEvent);
 
         while (!g_state.shutdownRequested) {
             HANDLE hRegEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             if (!hRegEvent) break;
 
-            res = RegNotifyChangeKeyValue(hKey, TRUE, REG_NOTIFY_CHANGE_LAST_SET, hRegEvent, TRUE);
+            res = RegNotifyChangeKeyValue(hKey, TRUE, REG_NOTIFY_CHANGE_LAST_SET, hRegEvent, FALSE);
             if (res != ERROR_SUCCESS) {
                 CloseHandle(hRegEvent);
-                if (res == ERROR_CALL_NOT_IMPLEMENTED) {
-                    // Запасной вариант — опрос раз в секунду
-                    Sleep(1000);
-                    SetEvent(g_hUacChangedEvent);
-                }
+                Sleep(1000);
+                SetEvent(g_hUacChangedEvent);
                 break;
             }
 
-            // Ждём изменение реестра или сигнал завершения
             HANDLE events[2] = { hRegEvent, g_hShutdownEvent };
             DWORD waitRes = WaitForMultipleObjects(2, events, FALSE, INFINITE);
-
             CloseHandle(hRegEvent);
+
             if (waitRes == WAIT_OBJECT_0) {
-                // Реестр изменился
                 SetEvent(g_hUacChangedEvent);
             } else if (waitRes == WAIT_OBJECT_0 + 1) {
-                // Завершение
                 break;
             } else {
                 break;
@@ -326,19 +370,24 @@ DWORD WINAPI MonitorThreadProc(LPVOID) {
 
 // =========================== WATCHDOG ===========================
 void RunWatchdog(DWORD parentPid) {
-    g_logger.LogInfo(L"Watchdog запущен. Охраняю процесс PID " + std::to_wstring(parentPid));
+    g_logger.LogInfo(L"Watchdog запущен. Охраняю PID " + std::to_wstring(parentPid));
     HANDLE hParent = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
     if (!hParent) {
         g_logger.LogError(L"Watchdog: не удалось открыть родительский процесс.");
         return;
     }
-    // Ждём, пока родительский процесс завершится
     WaitForSingleObject(hParent, INFINITE);
     CloseHandle(hParent);
 
-    g_logger.LogWarning(L"Watchdog: родительский процесс завершён. Перезапускаю UACGuard...");
+    g_logger.LogWarning(L"Watchdog: родительский процесс завершён. Перезапуск через " +
+                        std::to_wstring(Config::WATCHDOG_RESTART_DELAY_SEC) + L" сек...");
+    Sleep(Config::WATCHDOG_RESTART_DELAY_SEC * 1000);
+
     wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) {
+        g_logger.LogError(L"Watchdog: не удалось получить путь к исполняемому файлу.");
+        return;
+    }
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
     if (CreateProcessW(path, nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
@@ -352,14 +401,17 @@ void RunWatchdog(DWORD parentPid) {
 
 void LaunchWatchdog(DWORD parentPid) {
     wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) {
+        g_logger.LogError(L"Не удалось получить путь к исполняемому файлу.");
+        return;
+    }
     wchar_t cmdLine[MAX_PATH + 30];
     swprintf_s(cmdLine, L"\"%s\" %s %lu", path, Config::WATCHDOG_ARG, parentPid);
 
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi;
     if (CreateProcessW(nullptr, cmdLine, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(pi.hProcess);
+        g_hWatchdogProcess = pi.hProcess;  // Сохраняем для возможного аварийного завершения
         CloseHandle(pi.hThread);
         g_logger.LogInfo(L"Watchdog-процесс запущен.");
     } else {
@@ -367,9 +419,18 @@ void LaunchWatchdog(DWORD parentPid) {
     }
 }
 
+// =========================== ЗАВЕРШЕНИЕ ПОТОКОВ ===========================
+void JoinThreads(HANDLE h1, HANDLE h2) {
+    // Ждём каждый поток отдельно с таймаутом
+    if (WaitForSingleObject(h1, Config::THREAD_JOIN_TIMEOUT_MS) != WAIT_OBJECT_0)
+        g_logger.LogWarning(L"Поток 1 не завершился за отведённое время.");
+    if (WaitForSingleObject(h2, Config::THREAD_JOIN_TIMEOUT_MS) != WAIT_OBJECT_0)
+        g_logger.LogWarning(L"Поток 2 не завершился за отведённое время.");
+}
+
 // =========================== ТОЧКА ВХОДА ===========================
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    // Проверяем аргументы командной строки — может, нас запустили как watchdog
+    // Аргументы командной строки
     int argc;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc >= 3 && wcscmp(argv[1], Config::WATCHDOG_ARG) == 0) {
@@ -380,7 +441,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
     if (argv) LocalFree(argv);
 
-    // Мьютекс — только один экземпляр программы
+    // Мьютекс
     HANDLE hMutex = CreateMutexW(nullptr, FALSE, Config::MUTEX_NAME);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         g_logger.LogInfo(L"Другой экземпляр уже запущен. Выхожу.");
@@ -388,15 +449,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         return 0;
     }
 
-    // Проверяем права администратора
+    // Проверка прав администратора
     BOOL isElevated = FALSE;
     HANDLE hToken = nullptr;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
         TOKEN_ELEVATION elevation;
         DWORD size = sizeof(TOKEN_ELEVATION);
-        if (GetTokenInformation(hToken, TokenElevation, &elevation, size, &size)) {
+        if (GetTokenInformation(hToken, TokenElevation, &elevation, size, &size))
             isElevated = elevation.TokenIsElevated;
-        }
         CloseHandle(hToken);
     }
     if (!isElevated) {
@@ -405,58 +465,67 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         return 1;
     }
 
-    g_logger.LogInfo(L"UACGuard запускается...");
+    g_logger.LogInfo(L"UACGuard v1.0.3 запускается...");
 
-    // Создаём глобальные события
-    g_hUacChangedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // Автосброс
-    g_hShutdownEvent   = CreateEventW(nullptr, TRUE, FALSE, nullptr);    // Ручной сброс
+    // Создаём события ДО регистрации обработчика консоли
+    g_hUacChangedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // автосброс
+    g_hShutdownEvent   = CreateEventW(nullptr, TRUE, FALSE, nullptr);   // ручной сброс
     if (!g_hUacChangedEvent || !g_hShutdownEvent) {
         g_logger.LogError(L"Не удалось создать события синхронизации.");
         CloseHandle(hMutex);
         return 1;
     }
 
-    // Устанавливаемся в автозагрузку и запускаем watchdog
+    // Регистрируем обработчик консольных событий
+    if (!SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE)) {
+        g_logger.LogError(L"Не удалось зарегистрировать обработчик консольных событий.");
+        // Не критично, продолжаем работу
+    }
+
+    // Автозагрузка и watchdog
     InstallAutorun();
     EnsureAutorun();
     LaunchWatchdog(GetCurrentProcessId());
 
-    // Периодическая проверка автозагрузки в отдельном потоке
+    // Поток проверки автозагрузки
     std::thread autoRunThread([]() {
         while (!g_state.shutdownRequested) {
-            for (int i = 0; i < Config::AUTORUN_CHECK_SEC; ++i) {
-                if (g_state.shutdownRequested) return;
-                Sleep(1000);
-            }
+            if (WaitForSingleObject(g_hShutdownEvent, Config::AUTORUN_CHECK_SEC * 1000) == WAIT_OBJECT_0)
+                break;
             EnsureAutorun();
         }
     });
 
-    // Запускаем рабочие потоки
+    // Рабочие потоки
     HANDLE hMonitorThread = CreateThread(nullptr, 0, MonitorThreadProc, nullptr, 0, nullptr);
     HANDLE hHandlerThread = CreateThread(nullptr, 0, HandlerThreadProc, nullptr, 0, nullptr);
-
     if (!hMonitorThread || !hHandlerThread) {
         g_logger.LogError(L"Не удалось запустить рабочие потоки.");
+        // Watchdog не убиваем, он перезапустит программу с задержкой
         g_state.shutdownRequested = true;
         SetEvent(g_hShutdownEvent);
-        if (hMonitorThread) WaitForSingleObject(hMonitorThread, 5000);
-        if (hHandlerThread) WaitForSingleObject(hHandlerThread, 5000);
+        JoinThreads(hMonitorThread, hHandlerThread);
+        CloseHandle(hMutex);
+        // Закрываем дескриптор watchdog перед выходом
+        if (g_hWatchdogProcess) {
+            CloseHandle(g_hWatchdogProcess);
+            g_hWatchdogProcess = nullptr;
+        }
         return 1;
     }
 
-    // Ждём завершения любого из потоков (или системного выключения)
+    // Главный поток ждёт завершения рабочих потоков (бесконечно, пока не придёт сигнал shutdown)
     HANDLE threads[] = { hMonitorThread, hHandlerThread };
     WaitForMultipleObjects(2, threads, FALSE, INFINITE);
 
-    // Начинаем корректное завершение
+    // Если дошли сюда — инициируем завершение
     g_state.shutdownRequested = true;
     SetEvent(g_hShutdownEvent);
 
-    // Ждём завершения потока проверки автозагрузки
-    if (autoRunThread.joinable()) {
+    JoinThreads(hMonitorThread, hHandlerThread);
+
+    if (autoRunThread.joinable())
         autoRunThread.join();
-    }
 
     CloseHandle(hMonitorThread);
     CloseHandle(hHandlerThread);
@@ -464,6 +533,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     CloseHandle(g_hShutdownEvent);
     CloseHandle(g_hUacChangedEvent);
 
-    g_logger.LogInfo(L"UACGuard завершил работу.");
+    // Закрываем дескриптор watchdog (watchdog остаётся жив, он перезапустит нас при необходимости)
+    if (g_hWatchdogProcess) {
+        CloseHandle(g_hWatchdogProcess);
+        g_hWatchdogProcess = nullptr;
+    }
+
+    g_logger.LogInfo(L"UACGuard завершил работу (будет перезапущен watchdog'ом при падении).");
     return 0;
 }
